@@ -1,0 +1,23 @@
+# ML Module Requirements
+# Requirements for all ML modules: prepare_dataset, triplet_memory_dataset, model, early_stopping
+
+# Core dependencies
+torch>=2.0.0
+torchaudio>=2.0.0
+soundfile>=0.12.0
+tqdm>=4.65.0
+joblib>=1.3.0
+
+# MLflow for experiment tracking
+mlflow>=2.0.0
+
+# boto3 is required for MLflow to work with S3/MinIO artifacts
+# MLflow uses boto3 internally for S3-compatible storage operations
+boto3>=1.28.0
+
+# Optional but recommended
+python-dotenv>=1.0.0
+
+# Optional: for visualization and plotting (used in triplet_memory_dataset.py and train.py)
+matplotlib>=3.5.0
+
