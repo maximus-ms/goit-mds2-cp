@@ -18,8 +18,4 @@ if [ $? -ne 0 ]; then
     echo "Error: Failed to read data from flash"
     exit 1
 fi
-
-echo "For wav conversion run:"
-echo "python3 bin2wav.py $dir/data_dump_$timestamp.bin $dir/output_$timestamp.wav -r [rate] -C [crc32]"
-echo "data_dump file full path: " `pwd`"/$dir/data_dump_$timestamp.bin"
 echo "Done"

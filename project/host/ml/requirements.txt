@@ -21,3 +21,10 @@ python-dotenv>=1.0.0
 # Optional: for visualization and plotting (used in triplet_memory_dataset.py and train.py)
 matplotlib>=3.5.0
 
+# Optional: for interactive 3D plots in Jupyter notebooks (visualize_embeddings.py)
+# Use: %matplotlib widget in Jupyter notebook
+ipympl>=0.9.0
+
+# Optional: for dimensionality reduction in visualize_embeddings.py (PCA, t-SNE)
+scikit-learn>=1.0.0
+

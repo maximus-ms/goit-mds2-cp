@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Конвертер bin файлу в WAV формат.
-Bin файл містить інтерлівовані samples з кількох каналів.
-Підтримує 16-bit та 32-bit samples.
+Binary to WAV converter.
+Binary file contains interleaved samples from multiple channels.
+Supports 16-bit and 32-bit samples.
 """
 
 import struct
@@ -15,8 +15,8 @@ import ctypes
 
 def calculate_crc32(data):
     """
-    Розраховує CRC32 контрольну суму (як в ESP-IDF esp_rom_crc32_le).
-    Використовує zlib.crc32 з початковим значенням 0xFFFFFFFF.
+    Calculates CRC32 checksum (as in ESP-IDF esp_rom_crc32_le).
+    Uses zlib.crc32 with initial value 0xFFFFFFFF.
     """
     crc = zlib.crc32(data, 0xFFFFFFFF) & 0xFFFFFFFF
     return crc
@@ -24,41 +24,41 @@ def calculate_crc32(data):
 
 def calculate_simple_sum(data):
     """
-    Розраховує просту суму всіх байтів.
+    Calculates simple sum of all bytes.
     """
     return sum(data)
 
 def sample_processor(sample, sample_width):
-    """Обробляє семпл."""
+    """
+    Processes a sample.
+    """
+    b = sample
     if sample_width == 16:
-        return ctypes.c_int16(sample).value
+        c = ctypes.c_int16(b).value
     else:
-        return ctypes.c_int32(sample).value
+        c = ctypes.c_int32(b).value
+    return c
 
 
 def samples_normalizer(samples, sample_width_bits):
     """
-    Нормалізує семпли до відповідного діапазону залежно від sample_width_bits.
+    Normalizes samples to appropriate range depending on sample_width_bits.
     
     Args:
-        samples: Список семплів для нормалізації
-        sample_width_bits: Ширина семплу в бітах (16 або 32)
+        samples: List of samples to normalize
+        sample_width_bits: Sample width in bits (16 or 32)
     """
     max_sample = max(samples)
     min_sample = min(samples)
     max_abs = max(abs(max_sample), abs(min_sample))
     
-    # Визначаємо діапазон для нормалізації залежно від sample_width_bits
     if sample_width_bits == 16:
-        # 16-bit signed integer: [-32768, 32767]
         max_range = 32767
         min_range = -32768
     elif sample_width_bits == 32:
-        # 32-bit signed integer: [-2147483647, 2147483647]
         max_range = 2147483647
         min_range = -2147483647
     else:
-        # Для інших розмірів використовуємо максимальний діапазон
         max_range = 2147483647
         min_range = -2147483647
     
@@ -78,104 +78,83 @@ def samples_normalizer(samples, sample_width_bits):
 def bin_to_wav(input_file, output_file, num_channels=2, sample_rate=44100, sample_width=32,
                 expected_crc32=0):
     """
-    Конвертує bin файл в WAV формат.
+    Converts binary file to WAV format.
     
     Args:
-        input_file: Шлях до вхідного bin файлу
-        output_file: Шлях до вихідного WAV файлу
-        num_channels: Кількість каналів (1=mono, 2=stereo, тощо)
-        sample_rate: Частота семплювання (Гц)
-        sample_width: Ширина семплу в бітах (16 або 32)
-        expected_crc32: Очікувана CRC32 контрольна сума (hex рядок або int)
+        input_file: Path to input binary file
+        output_file: Path to output WAV file
+        num_channels: Number of channels (1=mono, 2=stereo, etc.)
+        sample_rate: Sampling rate (Hz)
+        sample_width: Sample width in bits (16 or 32)
+        expected_crc32: Expected CRC32 checksum (hex string or int)
     """
-    # Перевірка існування файлу
     if not os.path.exists(input_file):
-        print(f"Помилка: файл '{input_file}' не знайдено")
+        print(f"Error: file '{input_file}' not found")
         return False
     
-    # Читаємо bin файл
     with open(input_file, 'rb') as f:
         data = f.read()
     
     file_size = len(data)
-    
     calculated_crc32 = calculate_crc32(data)
     calculated_sum = calculate_simple_sum(data)
     
-    # Перевірка контрольної суми
     checksum_valid = True
     if expected_crc32 != 0:
-        # Конвертуємо hex рядок в int якщо потрібно
         if isinstance(expected_crc32, str):
-            # Видаляємо префікс 0x якщо є
             expected_crc32 = expected_crc32.replace('0x', '').replace('0X', '')
             try:
                 expected_crc32 = int(expected_crc32, 16)
             except ValueError:
-                print(f"Помилка: некоректний формат CRC32: {expected_crc32}")
+                print(f"Error: invalid CRC32 format: {expected_crc32}")
                 return False
         elif isinstance(expected_crc32, int):
             pass
         else:
-            print(f"Помилка: некоректний тип CRC32")
+            print(f"Error: invalid CRC32 type")
             return False
         
         if calculated_crc32 != expected_crc32:
-            print(f"CRC32 mismatch: expected 0x{expected_crc32:08x}, got 0x{calculated_crc32:08x}")
             checksum_valid = False
+            print("ERROR: Checksum does not match!")
             response = input("Continue conversion? (y/n): ")
             if response.lower() != 'y':
                 return False
     
-    # Конвертуємо біти в байти для розрахунків
     sample_width_bytes = sample_width // 8
-    
-    # Перевірка розміру
-    sample_size = sample_width_bytes * num_channels  # Розмір одного "кадру" (frame) в байтах
+    sample_size = sample_width_bytes * num_channels
     if file_size % sample_size != 0:
-        print(f"Попередження: розмір файлу ({file_size}) не кратний розміру кадру ({sample_size})")
-        # Обрізаємо до кратного розміру
         file_size = (file_size // sample_size) * sample_size
         data = data[:file_size]
     
     num_samples = file_size // sample_size
     
-    # Розпаковуємо дані залежно від sample_width (в бітах)
     samples = []
     unpack_format = {
-        16: '<h',  # 16-bit signed
-        32: '<i'   # 32-bit signed
+        16: '<h',
+        32: '<i'
     }
     
     if sample_width not in unpack_format:
-        print(f"Помилка: непідтримуваний розмір семплу: {sample_width} біт")
+        print(f"Error: unsupported sample width: {sample_width} bits")
         return False
     
     fmt = unpack_format[sample_width]
     for i in range(0, file_size, sample_width_bytes):
-        # Читаємо signed integer відповідного розміру (little-endian)
         sample = struct.unpack(fmt, data[i:i+sample_width_bytes])[0]
         samples.append(sample_processor(sample, sample_width))
     
     samples = samples_normalizer(samples, sample_width)
     
-    # WAV підтримує 32-bit float або 16-bit/24-bit/32-bit integer
-    # Використовуємо відповідний формат залежно від sample_width
-    
-    # Створюємо WAV файл
     with open(output_file, 'wb') as wav_file:
-        # WAV заголовок
-        # RIFF chunk
         wav_file.write(b'RIFF')
-        # Розмір файлу - 8 (буде заповнено пізніше)
         wav_file.write(struct.pack('<I', 0))
         wav_file.write(b'WAVE')
         
-        # fmt chunk
         wav_file.write(b'fmt ')
-        fmt_chunk_size = 16  # Розмір fmt chunk для PCM
+        fmt_chunk_size = 16
         wav_file.write(struct.pack('<I', fmt_chunk_size))
-        audio_format = 1  # 1 = PCM
+        audio_format = 1
         wav_file.write(struct.pack('<H', audio_format))
         wav_file.write(struct.pack('<H', num_channels))
         wav_file.write(struct.pack('<I', sample_rate))
@@ -183,26 +162,22 @@ def bin_to_wav(input_file, output_file, num_channels=2, sample_rate=44100, sampl
         wav_file.write(struct.pack('<I', byte_rate))
         block_align = num_channels * sample_width_bytes
         wav_file.write(struct.pack('<H', block_align))
-        bits_per_sample = sample_width  # sample_width вже в бітах
+        bits_per_sample = sample_width
         wav_file.write(struct.pack('<H', bits_per_sample))
         
-        # data chunk
         wav_file.write(b'data')
         data_size = len(samples) * sample_width_bytes
         wav_file.write(struct.pack('<I', data_size))
         
-        # Записуємо дані залежно від sample_width (в бітах)
         pack_format = {
-            16: '<h',  # 16-bit signed
-            32: '<i'   # 32-bit signed
+            16: '<h',
+            32: '<i'
         }
         
         fmt = pack_format[sample_width]
         for sample in samples:
-            # Записуємо signed integer відповідного розміру (little-endian)
             wav_file.write(struct.pack(fmt, sample))
         
-        # Оновлюємо розмір RIFF chunk
         file_size_total = wav_file.tell() - 8
         wav_file.seek(4)
         wav_file.write(struct.pack('<I', file_size_total))
@@ -212,10 +187,10 @@ def bin_to_wav(input_file, output_file, num_channels=2, sample_rate=44100, sampl
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Конвертує bin файл з інтерлівованими samples в WAV формат',
+        description='Converts binary file with interleaved samples to WAV format',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Приклади використання:
+Usage examples:
   %(prog)s input.bin output.wav
   %(prog)s input.bin output.wav --channels 2 --rate 44100
   %(prog)s input.bin output.wav -c 1 -r 8000 -w 16
@@ -224,34 +199,33 @@ def main():
         """
     )
     
-    parser.add_argument('input', help='Вхідний bin файл')
-    parser.add_argument('output', help='Вихідний WAV файл')
+    parser.add_argument('input', help='Input binary file')
+    parser.add_argument('output', help='Output WAV file')
     parser.add_argument('-c', '--channels', type=int, default=2,
-                        help='Кількість каналів (за замовчуванням: 2)')
+                        help='Number of channels (default: 2)')
     parser.add_argument('-r', '--rate', type=int, default=32000,
-                        help='Частота семплювання в Гц (за замовчуванням: 44100)')
+                        help='Sampling rate in Hz (default: 32000)')
     parser.add_argument('-w', '--width', type=int, default=32,
-                        help='Ширина семплу в бітах (16 або 32, за замовчуванням: 32)')
+                        help='Sample width in bits (16 or 32, default: 32)')
     parser.add_argument('-C', '--crc32', type=str, default=0,
-                        help='Очікувана CRC32 контрольна сума (hex, наприклад: 0x12345678 або 12345678)')
+                        help='Expected CRC32 checksum (hex, e.g.: 0x12345678 or 12345678)')
 
     
     args = parser.parse_args()
     
-    # Перевірка параметрів
     if args.channels < 1:
-        print("Помилка: кількість каналів повинна бути >= 1")
+        print("Error: number of channels must be >= 1")
         sys.exit(1)
     
     if args.crc32 != 0:
         args.crc32 = eval(args.crc32)
 
     if args.rate < 1:
-        print("Помилка: частота семплювання повинна бути >= 1")
+        print("Error: sampling rate must be >= 1")
         sys.exit(1)
     
     if args.width not in [16, 32]:
-        print("Помилка: ширина семплу повинна бути 16 або 32 біти")
+        print("Error: sample width must be 16 or 32 bits")
         sys.exit(1)
     
     success = bin_to_wav(

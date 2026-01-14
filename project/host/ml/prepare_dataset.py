@@ -15,12 +15,19 @@ Configuration:
 
 Usage as script:
     python prepare_dataset.py <input_path> [--output <output_path>] [--abnormal] [--jobs <n_jobs>]
+    # or if DATASET_INPUT_PATH is set in .env:
+    python prepare_dataset.py [--output <output_path>] [--abnormal] [--jobs <n_jobs>]
 
 Usage as module:
     from prepare_dataset import preprocess_dataset, load_dataset
+    # With explicit path
     dataset = preprocess_dataset('path/to/data', 'output.pt', use_abnormal=True)
-    # or load existing dataset
+    # Or using DATASET_INPUT_PATH from environment
+    dataset = preprocess_dataset(path_out='output.pt', use_abnormal=True)
+    # Load existing dataset with explicit path
     dataset = load_dataset('output.pt')
+    # Or using DEFAULT_DATASET_FILE from environment (if set)
+    dataset = load_dataset()
 """
 
 import torch
@@ -53,7 +60,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants (can be overridden via environment variables)
-DEFAULT_DATASET_FILE = os.getenv('DEFAULT_DATASET_FILE', 'dataset.pt')
+# DEFAULT_DATASET_FILE: If not set in env or empty, will be None (must be provided via --output or env)
+DEFAULT_DATASET_FILE = os.getenv('DEFAULT_DATASET_FILE', None)
+if DEFAULT_DATASET_FILE == '':
+    DEFAULT_DATASET_FILE = None
+DATASET_INPUT_PATH = os.getenv('DATASET_INPUT_PATH', None)
 TARGET_SR = int(os.getenv('DATASET_TARGET_SR', '16000'))
 
 # MIMII dataset channel mapping (optional, can be overridden)
@@ -196,7 +207,7 @@ def process_single_file(f_path: str, machine_type: str, machine_id: str, snr: st
         return None
 
 
-def preprocess_dataset(path_in: str, path_out: Optional[str] = None, 
+def preprocess_dataset(path_in: Optional[str] = None, path_out: Optional[str] = None, 
                      n_jobs: Optional[int] = None, use_abnormal: bool = False,
                      channel_mapping: Optional[Dict[str, Tuple[int, int]]] = None,
                      snr_values: Optional[List[str]] = None,
@@ -218,8 +229,11 @@ def preprocess_dataset(path_in: str, path_out: Optional[str] = None,
     }
     
     Args:
-        path_in: Path to root directory containing the dataset
-        path_out: Path to output file (None = path_in/dataset.pt)
+        path_in: Path to root directory containing the dataset.
+                 If None, uses value from DATASET_INPUT_PATH environment variable.
+                 Must be provided either as argument or via environment variable.
+        path_out: Path to output file. If None, uses DEFAULT_DATASET_FILE from environment
+                  variable as is. If DEFAULT_DATASET_FILE is not set, raises ValueError.
         n_jobs: Number of parallel processes (None = auto = number of CPU cores)
         use_abnormal: Whether to include abnormal samples (default: False)
         channel_mapping: Optional custom channel mapping dictionary.
@@ -230,15 +244,41 @@ def preprocess_dataset(path_in: str, path_out: Optional[str] = None,
     
     Returns:
         Dictionary containing the processed dataset
+    
+    Raises:
+        ValueError: If path_in is None and DATASET_INPUT_PATH is not set
+        ValueError: If path_in does not exist
     """
     start_time = time.time()
+    
+    # Use DATASET_INPUT_PATH from environment if path_in is not provided
+    if path_in is None:
+        path_in = DATASET_INPUT_PATH
+    
+    # Validate that path_in is provided
+    if path_in is None:
+        raise ValueError(
+            "path_in is required. Please provide it as an argument or set "
+            "DATASET_INPUT_PATH environment variable."
+        )
+    
+    # Validate that path exists
+    if not os.path.exists(path_in):
+        raise ValueError(f"Input path does not exist: {path_in}")
     
     if n_jobs is None:
         n_jobs = cpu_count() - 2
         if n_jobs < 1: n_jobs = 1
     
     if path_out is None:
-        path_out = os.path.join(path_in, DEFAULT_DATASET_FILE)
+        # Use DEFAULT_DATASET_FILE as is (if set)
+        if DEFAULT_DATASET_FILE:
+            path_out = DEFAULT_DATASET_FILE
+        else:
+            raise ValueError(
+                "path_out is required. Please provide it as an argument or set "
+                "DEFAULT_DATASET_FILE environment variable."
+            )
     
     logger.info(f"Using {n_jobs} processes for parallel processing")
     logger.info(f"Input path: {path_in}")
@@ -364,16 +404,29 @@ def preprocess_dataset(path_in: str, path_out: Optional[str] = None,
     return nested_data
 
 
-def load_dataset(path: str) -> Dict:
+def load_dataset(path: Optional[str] = DEFAULT_DATASET_FILE) -> Dict:
     """
     Load a preprocessed dataset from a PyTorch file.
     
     Args:
-        path: Path to the .pt file containing the dataset
+        path: Path to the .pt file containing the dataset.
+            If not provided, uses DEFAULT_DATASET_FILE from environment variable.
+            If DEFAULT_DATASET_FILE is not set, raises ValueError.
     
     Returns:
         Dictionary containing the loaded dataset
+    
+    Raises:
+        ValueError: If path is not provided and DEFAULT_DATASET_FILE is not set.
+        FileNotFoundError: If the dataset file does not exist.
     """
+    # Validate path
+    if path is None:
+        raise ValueError(
+            "path is required. Please provide it as an argument or set "
+            "DEFAULT_DATASET_FILE environment variable."
+        )
+    
     if not os.path.exists(path):
         raise FileNotFoundError(f"Dataset file not found: {path}")
     
@@ -439,6 +492,9 @@ Examples:
   # Process dataset with default settings
   python prepare_dataset.py data/MIMII
   
+  # Process using DATASET_INPUT_PATH from .env (if set)
+  python prepare_dataset.py --abnormal
+  
   # Process with abnormal samples included
   python prepare_dataset.py data/MIMII --abnormal
   
@@ -453,14 +509,16 @@ Examples:
     parser.add_argument(
         'input_path',
         type=str,
-        help='Path to root directory containing the dataset'
+        nargs='?',
+        default=DATASET_INPUT_PATH,
+        help=f'Path to root directory containing the dataset (default: from DATASET_INPUT_PATH env var or {DATASET_INPUT_PATH if DATASET_INPUT_PATH else "required"})'
     )
     
     parser.add_argument(
         '--output', '-o',
         type=str,
         default=None,
-        help=f'Path to output file (default: <input_path>/{DEFAULT_DATASET_FILE})'
+        help=f'Path to output file (default: DEFAULT_DATASET_FILE from env, or required if not set)'
     )
     
     parser.add_argument(
@@ -502,6 +560,13 @@ Examples:
     elif args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
+    # Check if input path is provided
+    if args.input_path is None:
+        logger.error("Input path is required. Please provide it as an argument or set DATASET_INPUT_PATH environment variable.")
+        logger.error("Usage: python prepare_dataset.py <input_path> [options]")
+        logger.error("   or: set DATASET_INPUT_PATH in .env file")
+        sys.exit(1)
+    
     # Check if input path exists
     if not os.path.exists(args.input_path):
         logger.error(f"Input path does not exist: {args.input_path}")
@@ -510,7 +575,14 @@ Examples:
     # If --info flag is set, load and display info
     if args.info:
         if args.output is None:
-            args.output = os.path.join(args.input_path, DEFAULT_DATASET_FILE)
+            # Use DEFAULT_DATASET_FILE as is (if set)
+            if DEFAULT_DATASET_FILE:
+                args.output = DEFAULT_DATASET_FILE
+            else:
+                logger.error("Output path is required. Please provide --output argument or set DEFAULT_DATASET_FILE environment variable.")
+                logger.error("Usage: python prepare_dataset.py <input_path> --info --output <path>")
+                logger.error("   or: set DEFAULT_DATASET_FILE in .env file")
+                sys.exit(1)
         
         if not os.path.exists(args.output):
             logger.error(f"Dataset file not found: {args.output}")

@@ -52,6 +52,7 @@ DEFAULT_MIN_LOSS = float(DEFAULT_MIN_LOSS) if DEFAULT_MIN_LOSS else None
 DEFAULT_MODE = os.getenv('EARLY_STOPPING_MODE', 'min')
 DEFAULT_VERBOSE = os.getenv('EARLY_STOPPING_VERBOSE', 'true').lower() == 'true'
 DEFAULT_RESTORE_BEST_WEIGHTS = os.getenv('EARLY_STOPPING_RESTORE_BEST_WEIGHTS', 'true').lower() == 'true'
+DEFAULT_MIN_EPOCHS = int(os.getenv('EARLY_STOPPING_MIN_EPOCHS', '30'))
 
 
 class EarlyStopping:
@@ -62,6 +63,9 @@ class EarlyStopping:
     - No improvement is seen for 'patience' epochs (patience-based stopping)
     - A minimum loss threshold is reached (threshold-based stopping)
     
+    Early stopping is disabled for the first 'min_epochs' epochs to allow
+    the model to train without premature stopping.
+    
     It can also restore the best model weights when training stops.
     
     Args:
@@ -71,17 +75,19 @@ class EarlyStopping:
         mode: 'min' for minimizing loss, 'max' for maximizing metric (default: 'min')
         verbose: Print early stopping information (default: True)
         restore_best_weights: Restore best weights when stopping (default: True)
+        min_epochs: Minimum number of epochs before early stopping can trigger (default: 30)
     """
     
     def __init__(self, patience: int = DEFAULT_PATIENCE, min_delta: float = DEFAULT_MIN_DELTA,
                  min_loss: float = None, mode: str = DEFAULT_MODE, verbose: bool = DEFAULT_VERBOSE,
-                 restore_best_weights: bool = DEFAULT_RESTORE_BEST_WEIGHTS):
+                 restore_best_weights: bool = DEFAULT_RESTORE_BEST_WEIGHTS, min_epochs: int = DEFAULT_MIN_EPOCHS):
         self.patience = patience
         self.min_delta = min_delta
         self.min_loss = min_loss if min_loss is not None else DEFAULT_MIN_LOSS
         self.mode = mode
         self.verbose = verbose
         self.restore_best_weights = restore_best_weights
+        self.min_epochs = min_epochs
         
         self.best_score = None
         self.counter = 0
@@ -91,7 +97,7 @@ class EarlyStopping:
         
         if self.verbose:
             logger.info(f"EarlyStopping initialized: patience={patience}, min_delta={min_delta}, "
-                       f"min_loss={self.min_loss}, mode={mode}")
+                       f"min_loss={self.min_loss}, mode={mode}, min_epochs={min_epochs}")
         
     def __call__(self, score: float, epoch: int, model=None) -> bool:
         """
@@ -105,6 +111,7 @@ class EarlyStopping:
         Returns:
             bool: True if training should be stopped
         """
+        # Track best score and weights regardless of min_epochs
         if self.best_score is None:
             # First epoch
             self.best_score = score
@@ -131,13 +138,22 @@ class EarlyStopping:
                 if self.verbose:
                     logger.info(f"✅ Improvement! Best score: {self.best_score:.6f} (epoch {epoch + 1})")
             else:
-                # No improvement
-                self.counter += 1
+                # No improvement (but don't increment counter if before min_epochs)
+                if epoch >= self.min_epochs:
+                    self.counter += 1
                 if self.verbose:
-                    logger.info(f"⏳ No improvement {self.counter}/{self.patience}. "
-                              f"Best: {self.best_score:.6f} (epoch {self.best_epoch + 1})")
+                    if epoch < self.min_epochs:
+                        logger.info(f"⏳ No improvement (warmup: epoch {epoch + 1}/{self.min_epochs}). "
+                                  f"Best: {self.best_score:.6f} (epoch {self.best_epoch + 1})")
+                    else:
+                        logger.info(f"⏳ No improvement {self.counter}/{self.patience}. "
+                                  f"Best: {self.best_score:.6f} (epoch {self.best_epoch + 1})")
         
-        # Check minimum loss threshold
+        # Early stopping checks are disabled before min_epochs
+        if epoch < self.min_epochs:
+            return False
+        
+        # Check minimum loss threshold (only after min_epochs)
         if self.min_loss is not None:
             if self.mode == 'min' and score <= self.min_loss:
                 self.early_stop = True
@@ -145,7 +161,7 @@ class EarlyStopping:
                     logger.info(f"🛑 Reached minimum loss threshold: {score:.6f} <= {self.min_loss:.6f}")
                 return True
         
-        # Check patience
+        # Check patience (only after min_epochs)
         if self.counter >= self.patience:
             self.early_stop = True
             if self.verbose:
@@ -185,7 +201,8 @@ class EarlyStopping:
             'patience': self.patience,
             'early_stopped': self.early_stop,
             'min_loss': self.min_loss,
-            'mode': self.mode
+            'mode': self.mode,
+            'min_epochs': self.min_epochs
         }
     
     def reset(self):
@@ -211,17 +228,18 @@ def test_early_stopping():
     logger.info("Testing EarlyStopping...")
     
     try:
-        # Test 1: Patience-based stopping
+        # Test 1: Patience-based stopping (with min_epochs)
         logger.info("\nTest 1: Patience-based stopping")
-        early_stopping = EarlyStopping(patience=3, min_delta=0.001, verbose=True)
+        early_stopping = EarlyStopping(patience=3, min_delta=0.001, min_epochs=5, verbose=True)
         
         # Simulate decreasing loss
         # Epoch 0: 1.0 (initial)
         # Epoch 1: 0.9 (improvement)
         # Epoch 2: 0.85 (improvement)
         # Epoch 3: 0.84 (improvement - best)
-        # Epoch 4-6: 0.84 (no improvement, patience exhausted)
-        losses = [1.0, 0.9, 0.85, 0.84, 0.84, 0.84, 0.84]
+        # Epoch 4-6: 0.84 (no improvement, but min_epochs=5, so counter starts at epoch 5)
+        # Epoch 5-7: 0.84 (no improvement, patience exhausted after epoch 7)
+        losses = [1.0, 0.9, 0.85, 0.84, 0.84, 0.84, 0.84, 0.84]
         stopped = False
         
         for epoch, loss in enumerate(losses):
@@ -246,10 +264,11 @@ def test_early_stopping():
         
         logger.info("✅ Test 1 passed")
         
-        # Test 2: Minimum loss threshold
+        # Test 2: Minimum loss threshold (with min_epochs)
         logger.info("\nTest 2: Minimum loss threshold")
-        early_stopping2 = EarlyStopping(patience=10, min_loss=0.5, verbose=True)
+        early_stopping2 = EarlyStopping(patience=10, min_loss=0.5, min_epochs=3, verbose=True)
         
+        # Loss reaches 0.5 at epoch 4, but min_epochs=3, so it should stop at epoch 4
         losses2 = [1.0, 0.9, 0.8, 0.6, 0.5]
         stopped2 = False
         

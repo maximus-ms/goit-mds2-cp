@@ -12,11 +12,16 @@ Configuration:
 
 Usage as module:
     from triplet_memory_dataset import TripletMemoryDataset
+    # With explicit path
     dataset = TripletMemoryDataset('dataset.pt', samples_per_epoch=5000)
+    # Or using DEFAULT_DATASET_FILE from env (if set)
+    dataset = TripletMemoryDataset(samples_per_epoch=5000)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=32)
 
 Usage as script:
     python triplet_memory_dataset.py --dataset dataset.pt [--samples 10] [--plot]
+    # Or using DEFAULT_DATASET_FILE from env (if set)
+    python triplet_memory_dataset.py [--samples 10] [--plot]
 """
 
 import torch
@@ -45,7 +50,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants (can be overridden via environment variables)
-DEFAULT_DATASET_FILE = os.getenv('DEFAULT_DATASET_FILE', 'dataset.pt')
+# DEFAULT_DATASET_FILE: If not set in env or empty, will be None (must be provided via parameter or env)
+DEFAULT_DATASET_FILE = os.getenv('DEFAULT_DATASET_FILE', None)
+if DEFAULT_DATASET_FILE == '':
+    DEFAULT_DATASET_FILE = None
 DEFAULT_SAMPLE_RATE = int(os.getenv('DATASET_TARGET_SR', '16000'))
 DEFAULT_DURATION_SEC = float(os.getenv('TRIPLET_DURATION_SEC', '1.0'))
 DEFAULT_SAMPLES_PER_EPOCH = int(os.getenv('TRIPLET_SAMPLES_PER_EPOCH', '5000'))
@@ -64,7 +72,9 @@ class TripletMemoryDataset(Dataset):
     come from different machine IDs or abnormal samples from the same machine.
     
     Args:
-        pt_file_path: Path to .pt file containing preprocessed audio data
+        pt_file_path: Path to .pt file containing preprocessed audio data.
+            If not provided, uses DEFAULT_DATASET_FILE from environment variable.
+            If DEFAULT_DATASET_FILE is not set, raises ValueError.
         duration_sec: Duration of audio chunks in seconds (default: 1.0)
         sample_rate: Sample rate of audio data (default: 16000)
         samples_per_epoch: Number of triplets to generate per epoch (default: 5000)
@@ -72,10 +82,13 @@ class TripletMemoryDataset(Dataset):
         positive_snr: SNR value for positive samples. Can be a string or None for random selection
         negative_snr: SNR value for negative samples. Can be a string or None for random selection
         skip_types: List of machine types to skip (e.g., ['fan'] to exclude fan data)
-        abnormal_ratio: Ratio of abnormal samples to use as negatives (default: 0.5)
+        abnormal_ratio: Ratio of abnormal samples to use as negatives (default: 0.5, i.e., 50% abnormal negatives, 50% different machine)
+    
+    Raises:
+        ValueError: If pt_file_path is not provided and DEFAULT_DATASET_FILE is not set.
     """
     
-    def __init__(self, pt_file_path: str, duration_sec: float = DEFAULT_DURATION_SEC,
+    def __init__(self, pt_file_path: Optional[str] = DEFAULT_DATASET_FILE, duration_sec: float = DEFAULT_DURATION_SEC,
                  sample_rate: int = DEFAULT_SAMPLE_RATE, samples_per_epoch: int = DEFAULT_SAMPLES_PER_EPOCH,
                  anchor_snr: Optional[Union[str, List[str]]] = None,
                  positive_snr: Optional[Union[str, List[str]]] = None,
@@ -83,40 +96,31 @@ class TripletMemoryDataset(Dataset):
                  skip_types: List[str] = None,
                  abnormal_ratio: float = DEFAULT_ABNORMAL_RATIO):
         
+        # Validate pt_file_path
+        if pt_file_path is None:
+            raise ValueError(
+                "pt_file_path is required. Please provide it as an argument or set "
+                "DEFAULT_DATASET_FILE environment variable."
+            )
+        
         self.sample_rate = sample_rate
         self.target_len = int(sample_rate * duration_sec)
         self.samples_per_epoch = samples_per_epoch
-        self.abnormal_ratio = abnormal_ratio
+        self.abnormal_ratio = float(abnormal_ratio)
         
         if skip_types is None:
             skip_types = []
-        
-        # Setup SNR selection functions
-        # NOTE: Remember to set SNR for anchor, positive and negative
-        if anchor_snr is None:
-            self._anchor_snr = lambda: random.choice(DEFAULT_SNR_VALUES)
-        elif isinstance(anchor_snr, list):
-            self._anchor_snr = lambda: random.choice(anchor_snr)
-        else:
-            self._anchor_snr = lambda: anchor_snr
-        
-        if positive_snr is None:
-            self._positive_snr = lambda: random.choice(DEFAULT_SNR_VALUES)
-        elif isinstance(positive_snr, list):
-            self._positive_snr = lambda: random.choice(positive_snr)
-        else:
-            self._positive_snr = lambda: positive_snr
-        
-        if negative_snr is None:
-            self._negative_snr = lambda: random.choice(DEFAULT_SNR_VALUES)
-        elif isinstance(negative_snr, list):
-            self._negative_snr = lambda: random.choice(negative_snr)
-        else:
-            self._negative_snr = lambda: negative_snr
-        
+
         logger.info(f"Loading dataset {pt_file_path} into RAM...")
         self.data = torch.load(pt_file_path, weights_only=True)
         logger.info("Dataset loaded! Preparing indices...")
+        
+        # Determine available SNR values from dataset
+        self.available_snr_values = self._get_available_snr_values()
+        logger.info(f"Available SNR values in dataset: {self.available_snr_values}")
+        
+        # Validate and update SNR selection functions based on available SNR values
+        self._validate_and_update_snr_functions(anchor_snr, positive_snr, negative_snr)
         
         # Check if abnormal samples exist in the dataset
         self.has_abnormal_samples = self._check_abnormal_samples()
@@ -130,21 +134,87 @@ class TripletMemoryDataset(Dataset):
         # self.ids_by_type = { 'fan': ['id_00', 'id_02'], 'pump': [...] }
         self.ids_by_type = {}
         self.machine_types = []
-        
+        min_ids_per_type = 1 if self.abnormal_ratio == 1.0 else 2
         for m_type, id_dict in self.data.items():
             if m_type in skip_types:
                 continue
             ids = list(id_dict.keys())
-            if len(ids) >= 2:
+            if len(ids) >= min_ids_per_type:
                 self.ids_by_type[m_type] = ids
                 self.machine_types.append(m_type)
             else:
                 logger.warning(f"Skipping type '{m_type}': insufficient IDs for Triplet Loss (minimum 2 required).")
-        
+
         logger.info(f"Ready machine types: {self.machine_types}")
-        
+
         # Transformation to spectrogram (use static method to ensure consistency)
-        self.transform, self.amplitude_to_db = self.create_mel_transform(sample_rate)
+        self.transform, self.amplitude_to_log = self.create_mel_transform(sample_rate)
+    
+    def _get_available_snr_values(self) -> List[str]:
+        """
+        Determine available SNR values from the dataset.
+        Assumes that available SNR values are the same for all devices.
+        
+        Returns:
+            List of available SNR values (e.g., ['6db', '0db', '_6db'])
+        """
+        snr_set = set()
+        
+        # Iterate through all machine types and IDs to collect SNR values
+        for m_type, id_dict in self.data.items():
+            for m_id, snr_dict in id_dict.items():
+                # snr_dict contains SNR levels as keys
+                for snr in snr_dict.keys():
+                    snr_set.add(snr)
+        
+        available_snr = sorted(list(snr_set))
+        
+        if not available_snr:
+            logger.warning("No SNR values found in dataset! Using default SNR values.")
+            return DEFAULT_SNR_VALUES.copy()
+        
+        return available_snr
+    
+    def _validate_and_update_snr_functions(self, anchor_snr: Optional[Union[str, List[str]]],
+                                           positive_snr: Optional[Union[str, List[str]]],
+                                           negative_snr: Optional[Union[str, List[str]]]):
+        """
+        Validate and update SNR selection functions based on available SNR values in dataset.
+        
+        Args:
+            anchor_snr: User-specified anchor SNR (None, string, or list)
+            positive_snr: User-specified positive SNR (None, string, or list)
+            negative_snr: User-specified negative SNR (None, string, or list)
+        """
+        # Helper function to filter SNR values to only those available in dataset
+        def filter_available_snr(snr_input: Optional[Union[str, List[str]]]) -> List[str]:
+            if snr_input is None:
+                return self.available_snr_values.copy()
+            elif isinstance(snr_input, list):
+                filtered = [s for s in snr_input if s in self.available_snr_values]
+                if not filtered:
+                    logger.warning(f"None of the specified SNR values {snr_input} are available. "
+                                 f"Using available SNR values: {self.available_snr_values}")
+                    return self.available_snr_values.copy()
+                return filtered
+            else:  # single string
+                if snr_input not in self.available_snr_values:
+                    logger.warning(f"Specified SNR '{snr_input}' not available in dataset. "
+                                 f"Available: {self.available_snr_values}. Using first available.")
+                    return [self.available_snr_values[0]]
+                return [snr_input]
+        
+        # Setup anchor SNR selection function
+        self.anchor_snr_list = filter_available_snr(anchor_snr)
+        self._anchor_snr = lambda: random.choice(self.anchor_snr_list)
+        
+        # Setup positive SNR selection function
+        self.positive_snr_list = filter_available_snr(positive_snr)
+        self._positive_snr = lambda: random.choice(self.positive_snr_list)
+        
+        # Setup negative SNR selection function
+        self.negative_snr_list = filter_available_snr(negative_snr)
+        self._negative_snr = lambda: random.choice(self.negative_snr_list)
     
     def _check_abnormal_samples(self) -> bool:
         """
@@ -163,7 +233,7 @@ class TripletMemoryDataset(Dataset):
                         elif isinstance(abnormal_samples, list) and len(abnormal_samples) > 0:
                             return True
         return False
-    
+
     def get_random_crop(self, full_wav_int16: torch.Tensor) -> torch.Tensor:
         """
         Extract a random crop from the full waveform.
@@ -184,11 +254,11 @@ class TripletMemoryDataset(Dataset):
             # Padding if recording is short
             padding = self.target_len - total_len
             crop_int16 = torch.nn.functional.pad(full_wav_int16, (0, padding))
-        
+            
         # Convert int16 -> float32
         # Divide by 32767 to get range [-1.0, 1.0]
         return crop_int16.float() / 32767.0
-    
+
     def get_random_sample(self, m_type: str, m_id: str, snr: str, normal: str = 'normal') -> Tuple[torch.Tensor, int]:
         """
         Get a random sample from the dataset.
@@ -213,7 +283,7 @@ class TripletMemoryDataset(Dataset):
         # Select random recording
         sample_id = random.randrange(len(recordings))
         return recordings[sample_id], sample_id
-    
+
     def get_sample(self, m_type: str, m_id: str, snr: str, normal: str = 'normal',
                    sample_id: Optional[int] = None) -> Tuple[torch.Tensor, int]:
         """
@@ -236,7 +306,7 @@ class TripletMemoryDataset(Dataset):
             return self.get_random_sample(m_type, m_id, snr, normal)
         else:
             return self.data[m_type][m_id][snr][normal][sample_id], sample_id
-    
+
     def get_triplet_sample(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str, str]:
         """
         Generate a triplet sample (anchor, positive, negative).
@@ -256,32 +326,33 @@ class TripletMemoryDataset(Dataset):
         
         # Determine negative sample type
         # Only use abnormal if ratio > 0 AND abnormal samples exist AND random chance
-        use_abnormal = (self.abnormal_ratio > 0 and 
-                       self.has_abnormal_samples and 
-                       random.random() < self.abnormal_ratio)
+        use_abnormal = (self.has_abnormal_samples and random.random() <= self.abnormal_ratio)
         
         if use_abnormal:
             negative_normal = 'abnormal'
             neg_id = anchor_id
         else:
             negative_normal = 'normal'
-        
+
+        anchor_snr = self._anchor_snr()
+        positive_snr = self._positive_snr()
+        negative_snr = self._negative_snr()
         anchor_wav, anchor_sample_id = self.get_random_sample(
-            m_type, anchor_id, self._anchor_snr(), normal=positive_normal
+            m_type, anchor_id, anchor_snr, normal=positive_normal
         )
         positive_wav, positive_sample_id = self.get_random_sample(
-            m_type, anchor_id, self._positive_snr(), normal=positive_normal
+            m_type, anchor_id, positive_snr, normal=positive_normal
         )
         negative_wav, negative_sample_id = self.get_random_sample(
-            m_type, neg_id, self._negative_snr(), normal=negative_normal
+            m_type, neg_id, negative_snr, normal=negative_normal
         )
-        
-        anchor_name = f"{m_type}[{anchor_id}]-{self._anchor_snr()}-{positive_normal}[{anchor_sample_id}]"
-        positive_name = f"{m_type}[{anchor_id}]-{self._positive_snr()}-{positive_normal}[{positive_sample_id}]"
-        negative_name = f"{m_type}[{neg_id}]-{self._negative_snr()}-{negative_normal}[{negative_sample_id}]"
-        
+
+        anchor_name = f"{m_type}[{anchor_id}]-{anchor_snr}-{positive_normal}[{anchor_sample_id}]"
+        positive_name = f"{m_type}[{anchor_id}]-{positive_snr}-{positive_normal}[{positive_sample_id}]"
+        negative_name = f"{m_type}[{neg_id}]-{negative_snr}-{negative_normal}[{negative_sample_id}]"
+
         return anchor_wav, positive_wav, negative_wav, anchor_name, positive_name, negative_name
-    
+
     def get_mel_spec(self, wav: torch.Tensor) -> torch.Tensor:
         """
         Convert waveform to mel spectrogram.
@@ -293,8 +364,8 @@ class TripletMemoryDataset(Dataset):
             Mel spectrogram tensor [channels, n_mels, time_frames]
         """
         spec = self.transform(wav)
-        return self.amplitude_to_db(spec)
-    
+        return self.amplitude_to_log(spec)
+
     @staticmethod
     def create_mel_transform(sample_rate: int = DEFAULT_SAMPLE_RATE):
         """
@@ -304,7 +375,7 @@ class TripletMemoryDataset(Dataset):
             sample_rate: Sample rate (default: 16000)
         
         Returns:
-            Tuple of (transform, amplitude_to_db)
+            Tuple of (transform, amplitude_to_log)
         """
         transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
@@ -313,8 +384,8 @@ class TripletMemoryDataset(Dataset):
             hop_length=512,
             power=2.0
         )
-        amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
-        return transform, amplitude_to_db
+        amplitude_to_log = lambda x: torch.log(x + 1e-10)
+        return transform, amplitude_to_log
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -328,7 +399,7 @@ class TripletMemoryDataset(Dataset):
         """
         # Triplet mining logic
         anchor_wav, positive_wav, negative_wav, anchor_name, positive_name, negative_name = self.get_triplet_sample()
-        
+
         anchor_wav_crop = self.get_random_crop(anchor_wav)
         positive_wav_crop = self.get_random_crop(positive_wav)
         negative_wav_crop = self.get_random_crop(negative_wav)
@@ -438,6 +509,159 @@ def benchmark_performance(dataset: TripletMemoryDataset, num_samples: int = 5000
     return results
 
 
+def test_module_infrastructure() -> bool:
+    """
+    Quick infrastructure test for the module.
+    Tests basic functionality without requiring a full dataset file.
+    
+    Returns:
+        True if all tests pass, False otherwise
+    """
+    logger.info("🧪 Starting module infrastructure test...")
+    tests_passed = 0
+    tests_total = 0
+    
+    try:
+        # Test 1: Static method create_mel_transform
+        tests_total += 1
+        logger.info("Test 1: Testing create_mel_transform static method...")
+        transform, amplitude_to_log = TripletMemoryDataset.create_mel_transform(sample_rate=16000)
+        assert transform is not None, "Transform should not be None"
+        assert amplitude_to_log is not None, "AmplitudeToLog should not be None"
+        logger.info("  ✅ create_mel_transform works correctly")
+        tests_passed += 1
+        
+        # Test 2: Create minimal test dataset in memory
+        tests_total += 1
+        logger.info("Test 2: Creating minimal test dataset...")
+        # Create a minimal dataset structure for testing
+        test_data = {
+            'fan': {
+                'id_00': {
+                    '6db': {
+                        'normal': [
+                            torch.randint(-32768, 32767, (1, 16000), dtype=torch.int16),
+                            torch.randint(-32768, 32767, (1, 16000), dtype=torch.int16),
+                        ]
+                    }
+                },
+                'id_02': {
+                    '6db': {
+                        'normal': [
+                            torch.randint(-32768, 32767, (1, 16000), dtype=torch.int16),
+                            torch.randint(-32768, 32767, (1, 16000), dtype=torch.int16),
+                        ]
+                    }
+                }
+            }
+        }
+        
+        # Save to temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+            temp_path = f.name
+            torch.save(test_data, temp_path)
+        tests_passed += 1
+        
+        try:
+            # Test 3: Create dataset instance
+            tests_total += 1
+            logger.info("Test 3: Creating TripletMemoryDataset instance...")
+            dataset = TripletMemoryDataset(
+                temp_path,
+                samples_per_epoch=5,
+                duration_sec=1.0,
+                sample_rate=16000
+            )
+            logger.info(f"  ✅ Dataset created successfully. Length: {len(dataset)}")
+            tests_passed += 1
+            
+            # Test 4: Test get_random_crop
+            tests_total += 1
+            logger.info("Test 4: Testing get_random_crop method...")
+            test_wav = torch.randint(-32768, 32767, (1, 16000), dtype=torch.int16)
+            cropped = dataset.get_random_crop(test_wav)
+            assert cropped.shape == (1, 16000), f"Expected shape (1, 16000), got {cropped.shape}"
+            assert cropped.dtype == torch.float32, f"Expected float32, got {cropped.dtype}"
+            assert cropped.min() >= -1.0 and cropped.max() <= 1.0, "Values should be normalized to [-1.0, 1.0]"
+            logger.info("  ✅ get_random_crop works correctly")
+            tests_passed += 1
+            
+            # Test 5: Test get_mel_spec
+            tests_total += 1
+            logger.info("Test 5: Testing get_mel_spec method...")
+            test_wav_float = torch.randn(1, 16000)
+            spec = dataset.get_mel_spec(test_wav_float)
+            assert len(spec.shape) == 3, f"Expected 3D tensor, got {len(spec.shape)}D"
+            assert spec.shape[0] == 1, f"Expected channel dimension 1, got {spec.shape[0]}"
+            logger.info(f"  ✅ get_mel_spec works correctly. Output shape: {spec.shape}")
+            tests_passed += 1
+            
+            # Test 6: Test get_triplet_sample
+            tests_total += 1
+            logger.info("Test 6: Testing get_triplet_sample method...")
+            anchor_wav, positive_wav, negative_wav, anchor_name, positive_name, negative_name = dataset.get_triplet_sample()
+            assert anchor_wav.shape[1] >= dataset.target_len, "Anchor waveform should have correct length"
+            assert positive_wav.shape[1] >= dataset.target_len, "Positive waveform should have correct length"
+            assert negative_wav.shape[1] >= dataset.target_len, "Negative waveform should have correct length"
+            logger.info(f"  ✅ get_triplet_sample works correctly")
+            logger.info(f"    Anchor: {anchor_name}")
+            logger.info(f"    Positive: {positive_name}")
+            logger.info(f"    Negative: {negative_name}")
+            tests_passed += 1
+            
+            # Test 7: Test __getitem__
+            tests_total += 1
+            logger.info("Test 7: Testing __getitem__ method...")
+            a_spec, p_spec, n_spec = dataset[0]
+            assert a_spec.shape == p_spec.shape == n_spec.shape, "All spectrograms should have same shape"
+            assert len(a_spec.shape) == 3, "Spectrogram should be 3D [channels, mel_bins, time_frames]"
+            logger.info(f"  ✅ __getitem__ works correctly. Spectrogram shape: {a_spec.shape}")
+            tests_passed += 1
+            
+            # Test 8: Test __len__
+            tests_total += 1
+            logger.info("Test 8: Testing __len__ method...")
+            dataset_len = len(dataset)
+            assert dataset_len == 5, f"Expected length 5, got {dataset_len}"
+            logger.info(f"  ✅ __len__ works correctly. Length: {dataset_len}")
+            tests_passed += 1
+            
+        finally:
+            # Cleanup temporary file
+            try:
+                os.unlink(temp_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary file: {e}")
+        
+        # Test 9: Test with different sample rates
+        tests_total += 1
+        logger.info("Test 9: Testing create_mel_transform with different sample rates...")
+        transform_8k, _ = TripletMemoryDataset.create_mel_transform(sample_rate=8000)
+        transform_16k, _ = TripletMemoryDataset.create_mel_transform(sample_rate=16000)
+        transform_48k, _ = TripletMemoryDataset.create_mel_transform(sample_rate=48000)
+        assert transform_8k is not None and transform_16k is not None and transform_48k is not None
+        logger.info("  ✅ create_mel_transform works with different sample rates")
+        tests_passed += 1
+        
+        # Summary
+        logger.info("=" * 60)
+        logger.info(f"Test Results: {tests_passed}/{tests_total} tests passed")
+        logger.info("=" * 60)
+        
+        if tests_passed == tests_total:
+            logger.info("✅ All infrastructure tests passed!")
+            return True
+        else:
+            logger.error(f"❌ {tests_total - tests_passed} test(s) failed!")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Test failed with error: {e}", exc_info=True)
+        logger.info(f"Test Results: {tests_passed}/{tests_total} tests passed")
+        return False
+
+
 def plot_spectrograms(a: torch.Tensor, p: torch.Tensor, n: torch.Tensor):
     """
     Plot three spectrograms side by side for visualization.
@@ -494,7 +718,8 @@ def main():
         '--dataset', '-d',
         type=str,
         default=DEFAULT_DATASET_FILE,
-        help=f'Path to dataset .pt file (default: {DEFAULT_DATASET_FILE})'
+        help=f'Path to dataset .pt file. If not provided, uses DEFAULT_DATASET_FILE from environment variable. '
+             f'If DEFAULT_DATASET_FILE is not set, this argument is required.'
     )
     parser.add_argument(
         '--samples', '-s',
@@ -530,8 +755,27 @@ def main():
         default=100,
         help='Number of warmup samples before benchmark (default: 100)'
     )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Run quick infrastructure test (verify module setup without requiring dataset file)'
+    )
     
     args = parser.parse_args()
+    
+    # Handle test mode
+    if args.test:
+        try:
+            success = test_module_infrastructure()
+            return 0 if success else 1
+        except Exception as e:
+            logger.error(f"Error during infrastructure test: {e}", exc_info=True)
+            return 1
+    
+    # Validate dataset path
+    if args.dataset is None:
+        logger.error("Dataset path is required. Please provide it via --dataset argument or set DEFAULT_DATASET_FILE environment variable.")
+        return 1
     
     if not os.path.exists(args.dataset):
         logger.error(f"Dataset file not found: {args.dataset}")
