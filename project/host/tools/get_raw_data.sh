@@ -9,6 +9,7 @@ fi
 
 dir=data
 dev=/dev/ttyACM0
+# baud=921600
 baud=2000000
 address=0x00410000
 timestamp=$(date +%Y%m%d_%H%M%S)
@@ -18,4 +19,8 @@ if [ $? -ne 0 ]; then
     echo "Error: Failed to read data from flash"
     exit 1
 fi
+
+echo "For wav conversion run:"
+echo "python3 bin2wav.py $dir/data_dump_$timestamp.bin $dir/output_$timestamp.wav -r [rate] -C [crc32]"
+echo "data_dump file full path: " `pwd`"/$dir/data_dump_$timestamp.bin"
 echo "Done"

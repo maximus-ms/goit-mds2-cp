@@ -28,3 +28,12 @@ ipympl>=0.9.0
 # Optional: for dimensionality reduction in visualize_embeddings.py (PCA, t-SNE)
 scikit-learn>=1.0.0
 
+# ============================================================
+# ESP32 Export Dependencies (export_esp32.py)
+# ============================================================
+
+# TensorFlow Lite (required by ai-edge-torch)
+tensorflow>=2.16.1
+
+# Direct PyTorch to TFLite conversion (Google's new library)
+ai-edge-torch>=0.2.0

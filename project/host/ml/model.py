@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_EMBEDDING_DIM = int(os.getenv('MODEL_EMBEDDING_DIM', '64'))
 
 
+def test_tiny_model():
+    print("test_tiny_model")
+
 
 class DepthwiseSeparableConv2d(nn.Module):
     """
@@ -237,6 +240,7 @@ class TinyAudioCNN(nn.Module):
         # Compress 128 features into final vector of dimension embedding_dim
         self.fc = nn.Linear(128, embedding_dim)
         
+        logger.debug(f"Initialized TinyAudioCNN with embedding_dim={embedding_dim}")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -374,6 +378,7 @@ class TinyAudioCNN_v2(nn.Module):
         # Compress 128 features into final vector of dimension embedding_dim
         self.fc = nn.Linear(128, embedding_dim)
         
+        logger.debug(f"Initialized TinyAudioCNN_v2 (optimized) with embedding_dim={embedding_dim}")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -521,6 +526,7 @@ class TinyAudioCNN_v3(nn.Module):
         # Compress 80 features into final vector of dimension embedding_dim
         self.fc = nn.Linear(80, embedding_dim)
         
+        logger.debug(f"Initialized TinyAudioCNN_v3 (MobileNetV2 style) with embedding_dim={embedding_dim}")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -594,6 +600,201 @@ class TinyAudioCNN_v3(nn.Module):
         }
 
 
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation Block: 'Attention' for channels."""
+    def __init__(self, in_channels, reduction=4):
+        super().__init__()
+        # Squeeze: Global Average Pooling (вже вбудовано в логіку forward)
+        # Excitation: 2 маленьких FC шари
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        # Global Average Pooling: [B, C, H, W] -> [B, C]
+        y = x.mean(dim=(2, 3))
+        # Обчислюємо вагу кожного каналу
+        y = self.fc(y).view(b, c, 1, 1)
+        # Множимо вхід на ваги (масштабуємо канали)
+        return x * y
+
+class MBConvBlock(nn.Module):
+    """
+    MobileNetV2 style Inverted Residual Block with SE-Attention.
+    Структура: Expand(1x1) -> Depthwise(3x3) -> SE -> Project(1x1)
+    """
+    def __init__(self, in_channels, out_channels, expand_ratio, stride):
+        super().__init__()
+        self.use_residual = (in_channels == out_channels) and (stride == 1)
+        hidden_dim = in_channels * expand_ratio
+        
+        layers = []
+        # 1. Expansion Phase (1x1 Conv)
+        if expand_ratio != 1:
+            layers.append(nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False))
+            layers.append(nn.BatchNorm2d(hidden_dim))
+            layers.append(nn.ReLU6(inplace=True)) # ReLU6 краще для квантування на ESP32
+        
+        # 2. Depthwise Convolution
+        layers.append(nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, 
+                                stride=stride, padding=1, groups=hidden_dim, bias=False))
+        layers.append(nn.BatchNorm2d(hidden_dim))
+        layers.append(nn.ReLU6(inplace=True))
+        
+        # 3. Squeeze-and-Excitation (Attention)
+        layers.append(SEBlock(hidden_dim))
+        
+        # 4. Projection Phase (1x1 Conv) - лінійний вихід (без ReLU)
+        layers.append(nn.Conv2d(hidden_dim, out_channels, kernel_size=1, bias=False))
+        layers.append(nn.BatchNorm2d(out_channels))
+        
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_residual:
+            return x + self.conv(x) # Skip connection
+        else:
+            return self.conv(x)
+
+class TinyAudioCNN_v4(nn.Module):
+    """
+    Lightweight CNN model for audio embedding generation (EfficientNet-like with SE-Attention).
+    
+    This version uses MBConv blocks (MobileNetV2 style Inverted Residuals) with 
+    Squeeze-and-Excitation attention for improved feature extraction. The model
+    is designed for deployment on ESP32-S3 with good balance of accuracy and efficiency.
+    
+    The model processes mel spectrograms and produces normalized embeddings
+    suitable for triplet loss training.
+    
+    Input shape: [Batch, 1, 64 (mel bins), 32 (time frames)]
+    Output shape: [Batch, embedding_dim] (normalized to unit length)
+    
+    Architecture:
+        - Stem: Standard Conv2d (1 -> 16 channels, stride=2)
+        - 6 MBConv blocks with SE-Attention
+        - Expansion ratios: 1, 4, 4, 4, 4, 4
+        - Channel progression: 16 -> 16 -> 32 -> 32 -> 64 -> 64 -> 128
+        - Global Average Pooling for variable input length
+        - Fully connected layer to embedding dimension
+        - L2 normalization (critical for triplet loss)
+        
+    Optimized for edge devices:
+        - Uses MBConv blocks with SE-Attention for better feature learning
+        - ReLU6 activations for better quantization on ESP32
+        - Efficient channel expansion with depthwise separable convolutions
+        - Skip connections for better gradient flow
+    
+    Args:
+        embedding_dim: Dimension of the output embedding vector (default: 64)
+    """
+    
+    def __init__(self, embedding_dim: int = DEFAULT_EMBEDDING_DIM):
+        super().__init__()
+        
+        self.embedding_dim = embedding_dim
+        
+        # --- STEM ---
+        # Перший шар залишаємо простим, щоб не забити RAM
+        # [Batch, 1, 64, 32] -> [Batch, 16, 32, 16] (stride 2 зменшує розмір)
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU6(inplace=True)
+        )
+        
+        # --- BACKBONE (MobileNetV2 blocks) ---
+        # t = expand_ratio (наскільки розширювати канали всередині блоку)
+        # c = out_channels
+        # s = stride
+        self.blocks = nn.Sequential(
+            # Block 1: 16 -> 16 (Refining, no downsample)
+            MBConvBlock(in_channels=16, out_channels=16, expand_ratio=1, stride=1),
+            
+            # Block 2: 16 -> 32 (Downsample: 32x16 -> 16x8)
+            MBConvBlock(in_channels=16, out_channels=32, expand_ratio=4, stride=2),
+            # Block 3: 32 -> 32 (Refining features + Residual)
+            MBConvBlock(in_channels=32, out_channels=32, expand_ratio=4, stride=1),
+            
+            # Block 4: 32 -> 64 (Downsample: 16x8 -> 8x4)
+            MBConvBlock(in_channels=32, out_channels=64, expand_ratio=4, stride=2),
+            # Block 5: 64 -> 64 (Deepening + Residual)
+            MBConvBlock(in_channels=64, out_channels=64, expand_ratio=4, stride=1),
+            
+            # Block 6: 64 -> 128 (Final features)
+            MBConvBlock(in_channels=64, out_channels=128, expand_ratio=4, stride=1)
+        )
+        
+        # --- HEAD ---
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(128, embedding_dim)
+        
+        logger.debug(f"Initialized TinyAudioCNN_v4 (EfficientNet-like with SE) with embedding_dim={embedding_dim}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the network.
+        
+        Args:
+            x: Input tensor of shape [Batch, 1, mel_bins, time_frames]
+        
+        Returns:
+            Normalized embedding tensor of shape [Batch, embedding_dim]
+        """
+        x = self.stem(x)
+        x = self.blocks(x)
+        
+        x = self.global_pool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        
+        # --- NORMALIZATION (Critical for Triplet Loss) ---
+        # All vectors become unit length (L2 norm = 1)
+        x = F.normalize(x, p=2, dim=1)
+        return x
+    
+    def count_parameters(self) -> dict:
+        """
+        Count the number of trainable and total parameters in the model.
+        
+        Returns:
+            Dictionary with 'total', 'trainable', and 'non_trainable' parameter counts
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        non_trainable_params = total_params - trainable_params
+        
+        return {
+            'total': total_params,
+            'trainable': trainable_params,
+            'non_trainable': non_trainable_params
+        }
+    
+    def get_model_info(self) -> dict:
+        """
+        Get detailed information about the model architecture.
+        
+        Returns:
+            Dictionary with model information including parameter counts and architecture details
+        """
+        params = self.count_parameters()
+        return {
+            'model_name': 'TinyAudioCNN_v4',
+            'architecture': 'MBConv + SE-Attention (EfficientNet-like)',
+            'embedding_dim': self.embedding_dim,
+            'total_parameters': params['total'],
+            'trainable_parameters': params['trainable'],
+            'non_trainable_parameters': params['non_trainable'],
+            'input_shape': '[Batch, 1, 64, 32]',
+            'output_shape': f'[Batch, {self.embedding_dim}]',
+            'normalization': 'L2 normalized (unit length vectors)'
+        }
+
+
 def test_model(embedding_dim: int = DEFAULT_EMBEDDING_DIM, batch_size: int = 2):
     """
     Test the model with dummy input and verify output properties.
@@ -605,7 +806,7 @@ def test_model(embedding_dim: int = DEFAULT_EMBEDDING_DIM, batch_size: int = 2):
     Returns:
         True if all tests pass, False otherwise
     """
-    logger.info("Testing TinyAudioCNN model...")
+    logger.info("Testing TinyAudioCNN models (v1-v4)...")
     
     try:
         # Create dummy input: [Batch, 1, 64 (mel), 32 (time)]
@@ -613,122 +814,72 @@ def test_model(embedding_dim: int = DEFAULT_EMBEDDING_DIM, batch_size: int = 2):
         dummy_input = torch.randn(batch_size, 1, 64, 32)
         logger.info(f"Input shape: {dummy_input.shape}")
         
-        # Initialize model (test all versions)
-        model_v1 = TinyAudioCNN(embedding_dim=embedding_dim)
-        model_v2 = TinyAudioCNN_v2(embedding_dim=embedding_dim)
-        model_v3 = TinyAudioCNN_v3(embedding_dim=embedding_dim)
-        logger.info(f"Models initialized with embedding_dim={embedding_dim}")
+        # Initialize all model versions
+        models = {
+            'v1': TinyAudioCNN(embedding_dim=embedding_dim),
+            'v2': TinyAudioCNN_v2(embedding_dim=embedding_dim),
+            'v3': TinyAudioCNN_v3(embedding_dim=embedding_dim),
+            'v4': TinyAudioCNN_v4(embedding_dim=embedding_dim),
+        }
+        logger.info(f"All models initialized with embedding_dim={embedding_dim}")
         
-        # Test v1
-        logger.info("\n--- Testing TinyAudioCNN (original) ---")
-        model = model_v1
-        
-        # Forward pass
-        model.eval()
-        with torch.no_grad():
-            output = model(dummy_input)
-        
-        logger.info(f"Output shape: {output.shape}")
-        
-        # Verify output properties
-        # 1. Check output shape
         expected_shape = (batch_size, embedding_dim)
-        if output.shape != expected_shape:
-            logger.error(f"Output shape mismatch! Expected {expected_shape}, got {output.shape}")
-            return False
-        
-        # 2. Check normalization (L2 norm should be ~1.0 for each vector)
-        norms = torch.norm(output, p=2, dim=1)
-        avg_norm = norms.mean().item()
-        min_norm = norms.min().item()
-        max_norm = norms.max().item()
-        
-        logger.info(f"Vector norms - Mean: {avg_norm:.6f}, Min: {min_norm:.6f}, Max: {max_norm:.6f}")
-        
-        # Allow small tolerance for floating point errors
         tolerance = 1e-5
-        if abs(avg_norm - 1.0) > tolerance:
-            logger.warning(f"Average norm ({avg_norm:.6f}) deviates from 1.0 by more than {tolerance}")
-            return False
         
-        # 3. Print model statistics
-        params = model.count_parameters()
-        logger.info("Model parameters:")
-        logger.info(f"  Total: {params['total']:,}")
-        logger.info(f"  Trainable: {params['trainable']:,}")
-        logger.info(f"  Non-trainable: {params['non_trainable']:,}")
-        
-        # 4. Print model info
-        model_info = model.get_model_info()
-        logger.info("Model information:")
-        for key, value in model_info.items():
-            logger.info(f"  {key}: {value}")
-        
-        # Test v2
-        logger.info("\n--- Testing TinyAudioCNN_v2 (optimized) ---")
-        model = model_v2
-        model.eval()
-        with torch.no_grad():
-            output_v2 = model(dummy_input)
-        
-        # Verify v2 output properties
-        if output_v2.shape != expected_shape:
-            logger.error(f"V2 Output shape mismatch! Expected {expected_shape}, got {output_v2.shape}")
-            return False
-        
-        norms_v2 = torch.norm(output_v2, p=2, dim=1)
-        avg_norm_v2 = norms_v2.mean().item()
-        if abs(avg_norm_v2 - 1.0) > tolerance:
-            logger.warning(f"V2 Average norm ({avg_norm_v2:.6f}) deviates from 1.0")
-            return False
-        
-        params_v2 = model.count_parameters()
-        logger.info("V2 Model parameters:")
-        logger.info(f"  Total: {params_v2['total']:,}")
-        logger.info(f"  Trainable: {params_v2['trainable']:,}")
-        
-        model_info_v2 = model.get_model_info()
-        logger.info("V2 Model information:")
-        for key, value in model_info_v2.items():
-            logger.info(f"  {key}: {value}")
-        
-        # Test v3
-        logger.info("\n--- Testing TinyAudioCNN_v3 (MobileNetV2 style) ---")
-        model = model_v3
-        model.eval()
-        with torch.no_grad():
-            output_v3 = model(dummy_input)
-        
-        # Verify v3 output properties
-        if output_v3.shape != expected_shape:
-            logger.error(f"V3 Output shape mismatch! Expected {expected_shape}, got {output_v3.shape}")
-            return False
-        
-        norms_v3 = torch.norm(output_v3, p=2, dim=1)
-        avg_norm_v3 = norms_v3.mean().item()
-        if abs(avg_norm_v3 - 1.0) > tolerance:
-            logger.warning(f"V3 Average norm ({avg_norm_v3:.6f}) deviates from 1.0")
-            return False
-        
-        params_v3 = model.count_parameters()
-        logger.info("V3 Model parameters:")
-        logger.info(f"  Total: {params_v3['total']:,}")
-        logger.info(f"  Trainable: {params_v3['trainable']:,}")
-        
-        model_info_v3 = model.get_model_info()
-        logger.info("V3 Model information:")
-        for key, value in model_info_v3.items():
-            logger.info(f"  {key}: {value}")
+        # Test each model version
+        for version, model in models.items():
+            model_info = model.get_model_info()
+            logger.info(f"\n--- Testing {model_info['model_name']} ({model_info['architecture']}) ---")
+            
+            model.eval()
+            with torch.no_grad():
+                output = model(dummy_input)
+            
+            logger.info(f"Output shape: {output.shape}")
+            
+            # Verify output shape
+            if output.shape != expected_shape:
+                logger.error(f"{version.upper()} Output shape mismatch! Expected {expected_shape}, got {output.shape}")
+                return False
+            
+            # Verify normalization
+            norms = torch.norm(output, p=2, dim=1)
+            avg_norm = norms.mean().item()
+            min_norm = norms.min().item()
+            max_norm = norms.max().item()
+            
+            logger.info(f"Vector norms - Mean: {avg_norm:.6f}, Min: {min_norm:.6f}, Max: {max_norm:.6f}")
+            
+            if abs(avg_norm - 1.0) > tolerance:
+                logger.warning(f"{version.upper()} Average norm ({avg_norm:.6f}) deviates from 1.0")
+                return False
+            
+            # Print model statistics
+            params = model.count_parameters()
+            logger.info("Model parameters:")
+            logger.info(f"  Total: {params['total']:,}")
+            logger.info(f"  Trainable: {params['trainable']:,}")
+            logger.info(f"  Non-trainable: {params['non_trainable']:,}")
         
         # Comparison
-        logger.info("\n--- Comparison ---")
-        params_v1 = model_v1.count_parameters()
-        logger.info(f"V1 Parameters: {params_v1['total']:,}")
-        logger.info(f"V2 Parameters: {params_v2['total']:,}")
-        logger.info(f"V3 Parameters: {params_v3['total']:,}")
-        logger.info(f"V1->V2 Reduction: {params_v1['total'] / params_v2['total']:.2f}x")
-        logger.info(f"V2->V3 Increase: {params_v3['total'] / params_v2['total']:.2f}x")
-        logger.info(f"V3 vs V1: {params_v3['total'] / params_v1['total']:.2f}x")
+        logger.info("\n" + "=" * 70)
+        logger.info("COMPARISON OF ALL MODEL VERSIONS")
+        logger.info("=" * 70)
+        
+        params_all = {v: m.count_parameters()['total'] for v, m in models.items()}
+        
+        for version, model in models.items():
+            info = model.get_model_info()
+            logger.info(f"\n{info['model_name']}:")
+            logger.info(f"  Architecture: {info['architecture']}")
+            logger.info(f"  Parameters:   {params_all[version]:,}")
+        
+        logger.info("\n--- Parameter Ratios ---")
+        logger.info(f"V1 (baseline):      {params_all['v1']:,} params")
+        logger.info(f"V2 vs V1:           {params_all['v2'] / params_all['v1']:.3f}x ({params_all['v1'] / params_all['v2']:.2f}x reduction)")
+        logger.info(f"V3 vs V1:           {params_all['v3'] / params_all['v1']:.3f}x")
+        logger.info(f"V4 vs V1:           {params_all['v4'] / params_all['v1']:.3f}x")
+        logger.info(f"V4 vs V3:           {params_all['v4'] / params_all['v3']:.3f}x")
         
         logger.info("\n✅ All tests passed!")
         return True
@@ -736,6 +887,122 @@ def test_model(embedding_dim: int = DEFAULT_EMBEDDING_DIM, batch_size: int = 2):
     except Exception as e:
         logger.error(f"Test failed with error: {e}", exc_info=True)
         return False
+
+
+def compare_all_models(embedding_dim: int = DEFAULT_EMBEDDING_DIM, batch_size: int = 2):
+    """
+    Comprehensive comparison of all TinyAudioCNN model versions.
+    
+    Compares: parameter counts, layer counts, FLOPs estimation, memory usage.
+    
+    Args:
+        embedding_dim: Dimension of embedding vector
+        batch_size: Batch size for test input
+    """
+    import time
+    
+    logger.info("=" * 80)
+    logger.info("COMPREHENSIVE MODEL COMPARISON")
+    logger.info("=" * 80)
+    
+    # Initialize all models
+    models = {
+        'TinyAudioCNN (v1)': TinyAudioCNN(embedding_dim=embedding_dim),
+        'TinyAudioCNN_v2': TinyAudioCNN_v2(embedding_dim=embedding_dim),
+        'TinyAudioCNN_v3': TinyAudioCNN_v3(embedding_dim=embedding_dim),
+        'TinyAudioCNN_v4': TinyAudioCNN_v4(embedding_dim=embedding_dim),
+    }
+    
+    dummy_input = torch.randn(batch_size, 1, 64, 32)
+    
+    results = []
+    
+    for name, model in models.items():
+        model.eval()
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        # Count layers
+        conv_layers = 0
+        bn_layers = 0
+        linear_layers = 0
+        other_layers = 0
+        
+        for module in model.modules():
+            if isinstance(module, nn.Conv2d):
+                conv_layers += 1
+            elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                bn_layers += 1
+            elif isinstance(module, nn.Linear):
+                linear_layers += 1
+            elif isinstance(module, (nn.ReLU, nn.ReLU6, nn.Sigmoid, nn.AdaptiveAvgPool2d, nn.MaxPool2d)):
+                other_layers += 1
+        
+        # Measure inference time (average over multiple runs)
+        num_runs = 100
+        with torch.no_grad():
+            # Warmup
+            for _ in range(10):
+                _ = model(dummy_input)
+            
+            # Timed runs
+            start_time = time.perf_counter()
+            for _ in range(num_runs):
+                _ = model(dummy_input)
+            end_time = time.perf_counter()
+        
+        avg_inference_ms = (end_time - start_time) / num_runs * 1000
+        
+        # Estimate model size in KB (float32 = 4 bytes per param)
+        model_size_kb = total_params * 4 / 1024
+        
+        results.append({
+            'name': name,
+            'total_params': total_params,
+            'trainable_params': trainable_params,
+            'conv_layers': conv_layers,
+            'bn_layers': bn_layers,
+            'linear_layers': linear_layers,
+            'other_layers': other_layers,
+            'total_layers': conv_layers + bn_layers + linear_layers,
+            'inference_ms': avg_inference_ms,
+            'model_size_kb': model_size_kb,
+        })
+    
+    # Print comparison table
+    logger.info(f"\n{'Model':<25} {'Params':>12} {'Conv':>6} {'BN':>6} {'FC':>6} {'Layers':>8} {'Size(KB)':>10} {'Infer(ms)':>10}")
+    logger.info("-" * 95)
+    
+    baseline_params = results[0]['total_params']
+    
+    for r in results:
+        ratio = r['total_params'] / baseline_params
+        logger.info(
+            f"{r['name']:<25} {r['total_params']:>12,} {r['conv_layers']:>6} {r['bn_layers']:>6} "
+            f"{r['linear_layers']:>6} {r['total_layers']:>8} {r['model_size_kb']:>10.1f} {r['inference_ms']:>10.3f}"
+        )
+    
+    logger.info("-" * 95)
+    logger.info("\n--- Relative to V1 (baseline) ---")
+    for r in results:
+        ratio = r['total_params'] / baseline_params
+        logger.info(f"{r['name']:<25}: {ratio:.3f}x params ({r['total_params']:,})")
+    
+    logger.info("\n--- Model Descriptions ---")
+    descriptions = {
+        'TinyAudioCNN (v1)': 'Standard convolutions - baseline model',
+        'TinyAudioCNN_v2': 'Depthwise separable convolutions - optimized for ESP32-S3',
+        'TinyAudioCNN_v3': 'Inverted residuals (MobileNetV2 style) - balanced capacity',
+        'TinyAudioCNN_v4': 'MBConv + SE-Attention (EfficientNet-like) - best features',
+    }
+    for name, desc in descriptions.items():
+        logger.info(f"  {name}: {desc}")
+    
+    logger.info("\n" + "=" * 80)
+    
+    return results
 
 
 def main():
@@ -765,47 +1032,53 @@ def main():
         action='store_true',
         help='Print model information'
     )
+    parser.add_argument(
+        '--compare',
+        action='store_true',
+        help='Run comprehensive comparison of all model versions'
+    )
     
     args = parser.parse_args()
     
     try:
+        if args.compare:
+            compare_all_models(args.embedding_dim, args.batch_size)
+            return 0
+        
         if args.info:
-            logger.info("=" * 70)
-            logger.info("TinyAudioCNN (Original)")
-            logger.info("=" * 70)
-            model_v1 = TinyAudioCNN(embedding_dim=args.embedding_dim)
-            model_info_v1 = model_v1.get_model_info()
-            for key, value in model_info_v1.items():
-                logger.info(f"{key:25}: {value}")
+            # All model versions
+            model_classes = [
+                ('TinyAudioCNN (Original)', TinyAudioCNN),
+                ('TinyAudioCNN_v2 (Depthwise Separable)', TinyAudioCNN_v2),
+                ('TinyAudioCNN_v3 (MobileNetV2 style)', TinyAudioCNN_v3),
+                ('TinyAudioCNN_v4 (MBConv + SE-Attention)', TinyAudioCNN_v4),
+            ]
             
-            logger.info("\n" + "=" * 70)
-            logger.info("TinyAudioCNN_v2 (Optimized for ESP32-S3)")
-            logger.info("=" * 70)
-            model_v2 = TinyAudioCNN_v2(embedding_dim=args.embedding_dim)
-            model_info_v2 = model_v2.get_model_info()
-            for key, value in model_info_v2.items():
-                logger.info(f"{key:25}: {value}")
+            model_infos = []
+            for title, model_class in model_classes:
+                logger.info("=" * 70)
+                logger.info(title)
+                logger.info("=" * 70)
+                model = model_class(embedding_dim=args.embedding_dim)
+                model_info = model.get_model_info()
+                model_infos.append(model_info)
+                for key, value in model_info.items():
+                    logger.info(f"{key:25}: {value}")
+                logger.info("")
             
-            logger.info("\n" + "=" * 70)
-            logger.info("TinyAudioCNN_v3 (MobileNetV2 style)")
+            # Comparison
             logger.info("=" * 70)
-            model_v3 = TinyAudioCNN_v3(embedding_dim=args.embedding_dim)
-            model_info_v3 = model_v3.get_model_info()
-            for key, value in model_info_v3.items():
-                logger.info(f"{key:25}: {value}")
+            logger.info("PARAMETER COMPARISON")
+            logger.info("=" * 70)
+            for info in model_infos:
+                logger.info(f"{info['model_name']:20}: {info['total_parameters']:>10,} params")
             
-            logger.info("\n" + "=" * 70)
-            logger.info("Comparison")
-            logger.info("=" * 70)
-            logger.info(f"V1 Parameters: {model_info_v1['total_parameters']:,}")
-            logger.info(f"V2 Parameters: {model_info_v2['total_parameters']:,}")
-            logger.info(f"V3 Parameters: {model_info_v3['total_parameters']:,}")
-            reduction_v1_v2 = model_info_v1['total_parameters'] / model_info_v2['total_parameters']
-            increase_v2_v3 = model_info_v3['total_parameters'] / model_info_v2['total_parameters']
-            ratio_v3_v1 = model_info_v3['total_parameters'] / model_info_v1['total_parameters']
-            logger.info(f"V1->V2 Reduction: {reduction_v1_v2:.2f}x")
-            logger.info(f"V2->V3 Increase: {increase_v2_v3:.2f}x")
-            logger.info(f"V3 vs V1: {ratio_v3_v1:.2f}x")
+            logger.info("\n--- Ratios relative to V1 ---")
+            baseline = model_infos[0]['total_parameters']
+            for info in model_infos:
+                ratio = info['total_parameters'] / baseline
+                logger.info(f"{info['model_name']:20}: {ratio:.3f}x")
+            
             logger.info("=" * 70)
             return 0
         

@@ -1,0 +1,45 @@
+menu "Acoustic Monitor"
+
+    menu "WiFi Settings"
+        config WIFI_SSID
+            string "WiFi SSID"
+            default "YOUR_SSID"
+            help
+                SSID (network name) of the WiFi network to connect to.
+
+        config WIFI_PASSWORD
+            string "WiFi Password"
+            default ""
+            help
+                Password for the WiFi network.
+                Leave empty for open networks.
+
+        config WIFI_CONNECT_TIMEOUT_MS
+            int "Connection timeout (ms)"
+            default 15000
+            range 5000 60000
+            help
+                Maximum time to wait for WiFi connection.
+    endmenu
+
+    menu "I2S Settings"
+        choice DUPLEX_MODE
+            prompt "I2S STD duplex/simplex select"
+            default USE_DUPLEX
+            help
+                Select duplex mode or simplex mode for the example
+
+            config USE_DUPLEX
+                bool "Duplex TX and RX channels"
+                help
+                    Allocate TX and RX channels on a same I2S controller in duplex mode, sharing the BCLK and WS signal
+
+            config USE_SIMPLEX
+                bool "Simplex TX and RX channels"
+                depends on !IDF_TARGET_ESP32S2
+                help
+                    Allocate TX and RX channels in duplex mode, they are totally separate.
+        endchoice
+    endmenu
+
+endmenu

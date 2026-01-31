@@ -63,12 +63,12 @@ def _import_torch_modules():
         # Import local modules
         # Support both absolute and relative imports
         try:
-            from ml.model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3
+            from ml.model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3, TinyAudioCNN_v4
             from ml.triplet_memory_dataset import TripletMemoryDataset
             from ml.early_stopping import EarlyStopping
         except ImportError:
             # Fallback to relative imports (when running as script from ml/ directory)
-            from model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3
+            from model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3, TinyAudioCNN_v4
             from triplet_memory_dataset import TripletMemoryDataset
             from early_stopping import EarlyStopping
         
@@ -80,6 +80,7 @@ def _import_torch_modules():
             'TinyAudioCNN': TinyAudioCNN,
             'TinyAudioCNN_v2': TinyAudioCNN_v2,
             'TinyAudioCNN_v3': TinyAudioCNN_v3,
+            'TinyAudioCNN_v4': TinyAudioCNN_v4,
             'TripletMemoryDataset': TripletMemoryDataset,
             'EarlyStopping': EarlyStopping
         }
@@ -432,7 +433,7 @@ def train_mlflow(experiment_name: str = DEFAULT_EXPERIMENT_NAME,
         early_stopping_enabled: Enable/disable early stopping
         early_stopping_min_epochs: Minimum number of epochs before early stopping can trigger (default: 30)
         save_checkpoints: Enable/disable saving checkpoints every 5 epochs (default: False, can be set via SAVE_CHECKPOINTS env var)
-        model_version: Model version to use ('1'/'v1' for TinyAudioCNN, '2'/'v2' for TinyAudioCNN_v2, '3'/'v3' for TinyAudioCNN_v3, default: '1')
+        model_version: Model version to use ('1'/'v1' for TinyAudioCNN, '2'/'v2' for TinyAudioCNN_v2, '3'/'v3' for TinyAudioCNN_v3, '4'/'v4' for TinyAudioCNN_v4, default: '1')
         loss_function: Loss function to use ('triplet_loss' or 'arcface', default: 'triplet_loss')
         force_cpu: Force training on CPU (default: False)
     
@@ -445,8 +446,8 @@ def train_mlflow(experiment_name: str = DEFAULT_EXPERIMENT_NAME,
     if model_version.startswith('v'):
         model_version = model_version[1:]  # Remove 'v' prefix if present
     
-    if model_version not in ['1', '2', '3']:
-        raise ValueError(f"model_version must be '1', '2', or '3' (or 'v1'/'v2'/'v3'), got '{model_version}'")
+    if model_version not in ['1', '2', '3', '4']:
+        raise ValueError(f"model_version must be '1', '2', '3', or '4' (or 'v1'/'v2'/'v3'/'v4'), got '{model_version}'")
     
     # Lazy import torch modules to avoid Jupyter kernel crashes
     modules = _import_torch_modules()
@@ -457,11 +458,15 @@ def train_mlflow(experiment_name: str = DEFAULT_EXPERIMENT_NAME,
     TinyAudioCNN = modules['TinyAudioCNN']
     TinyAudioCNN_v2 = modules['TinyAudioCNN_v2']
     TinyAudioCNN_v3 = modules['TinyAudioCNN_v3']
+    TinyAudioCNN_v4 = modules['TinyAudioCNN_v4']
     TripletMemoryDataset = modules['TripletMemoryDataset']
     EarlyStopping = modules['EarlyStopping']
     
     # Select model class based on version
-    if model_version == '3':
+    if model_version == '4':
+        ModelClass = TinyAudioCNN_v4
+        model_name = 'TinyAudioCNN_v4'
+    elif model_version == '3':
         ModelClass = TinyAudioCNN_v3
         model_name = 'TinyAudioCNN_v3'
     elif model_version == '2':
@@ -1344,9 +1349,9 @@ def main():
     parser.add_argument(
         '--model-version',
         type=str,
-        choices=['1', '2', '3', 'v1', 'v2', 'v3'],
+        choices=['1', '2', '3', '4', 'v1', 'v2', 'v3', 'v4'],
         default=DEFAULT_MODEL_VERSION,
-        help=f'Model version to use: 1 (TinyAudioCNN), 2 (TinyAudioCNN_v2, optimized), or 3 (TinyAudioCNN_v3, MobileNetV2 style, ~56k params) (default: {DEFAULT_MODEL_VERSION}, can also be set via MODEL_VERSION env var). Supports both formats: "1"/"2"/"3" or "v1"/"v2"/"v3"'
+        help=f'Model version to use: 1 (TinyAudioCNN), 2 (TinyAudioCNN_v2, optimized), 3 (TinyAudioCNN_v3, MobileNetV2 style, ~56k params), or 4 (TinyAudioCNN_v4, MBConv+SE, ~210k params) (default: {DEFAULT_MODEL_VERSION}, can also be set via MODEL_VERSION env var). Supports both formats: "1"/"2"/"3"/"4" or "v1"/"v2"/"v3"/"v4"'
     )
     parser.add_argument(
         '--test',

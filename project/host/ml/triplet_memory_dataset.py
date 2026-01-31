@@ -382,7 +382,8 @@ class TripletMemoryDataset(Dataset):
             n_mels=64,
             n_fft=1024,
             hop_length=512,
-            power=2.0
+            power=2.0,
+            norm='slaney' # Use torchaudio default normalization (norm='slaney')
         )
         amplitude_to_log = lambda x: torch.log(x + 1e-10)
         return transform, amplitude_to_log

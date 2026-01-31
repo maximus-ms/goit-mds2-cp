@@ -11,8 +11,9 @@
 #include "freertos/queue.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
+#include "esp_log.h"
 
-#include <stdio.h>
+static const char *TAG = "i2s";
 
 // Private variables
 static i2s_chan_handle_t rx_chan = NULL;
@@ -67,15 +68,17 @@ static i2s_event_callbacks_t cbs = {
 };
 
 void i2s_read_init(void) {
+    // Create DMA buffer queue
     dma_buffer_queue = xQueueCreate(DMA_BUFFER_QUEUE_SIZE, sizeof(dma_buffer_event_t));
     if (dma_buffer_queue == NULL) {
-        printf("Error: Failed to create DMA buffer queue\n");
+        ESP_LOGE(TAG, "Failed to create DMA buffer queue");
         return;
     }
+    ESP_LOGI(TAG, "DMA queue created (size=%d)", DMA_BUFFER_QUEUE_SIZE);
     
     // Configure I2S channel
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    rx_chan_cfg.dma_frame_num = 256;
+    rx_chan_cfg.dma_frame_num = DMA_BUFFER_FRAME_SIZE;
     rx_chan_cfg.dma_desc_num = DMA_BUFFER_QUEUE_SIZE;
     ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_chan));
 
@@ -100,11 +103,14 @@ void i2s_read_init(void) {
     
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &rx_std_cfg));
     i2s_channel_register_event_callback(rx_chan, &cbs, NULL);
+    
+    ESP_LOGI(TAG, "RX initialized (rate=%d Hz, bits=%d, ch=%d)", 
+             I2S_SAMPLING_RATE, I2S_DATA_BIT_WIDTH_VALUE, I2S_CHANNELS);
 }
 
 void i2s_read_start(uint32_t skip_first_ms) {
     if (dma_buffer_queue == NULL) {
-        printf("Error: DMA buffer queue not initialized\n");
+        ESP_LOGE(TAG, "DMA queue not initialized");
         return;
     }
 
@@ -113,8 +119,10 @@ void i2s_read_start(uint32_t skip_first_ms) {
         ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
         i2s_read_active = true;
         pause_reading = false;
+        ESP_LOGI(TAG, "Read started");
     } else {
         pause_reading = false;
+        ESP_LOGD(TAG, "Read resumed");
     }
 }
 
@@ -132,6 +140,9 @@ void i2s_read_stop(void) {
         ESP_ERROR_CHECK(i2s_channel_disable(rx_chan));
         i2s_read_active = false;
         led_clear();
+        ESP_LOGI(TAG, "Read stopped");
+    } else {
+        ESP_LOGD(TAG, "Already stopped");
     }
 }
 

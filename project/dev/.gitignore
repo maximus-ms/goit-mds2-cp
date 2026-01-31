@@ -1,0 +1,12 @@
+build/
+data/
+managed_components/
+__pycache__
+.venv/
+.env
+.vscode
+*.pt
+.cache/
+# ESP-IDF config with secrets
+sdkconfig
+sdkconfig.defaults.local

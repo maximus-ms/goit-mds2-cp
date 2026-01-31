@@ -112,11 +112,11 @@ except ImportError:
 # Import local modules
 # Support both absolute and relative imports
 try:
-    from ml.model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3
+    from ml.model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3, TinyAudioCNN_v4
     from ml.triplet_memory_dataset import TripletMemoryDataset
 except ImportError:
     # Fallback to relative imports (when running as script from ml/ directory)
-    from model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3
+    from model import TinyAudioCNN, TinyAudioCNN_v2, TinyAudioCNN_v3, TinyAudioCNN_v4
     from triplet_memory_dataset import TripletMemoryDataset
 
 # Constants (can be overridden via environment variables)
@@ -493,10 +493,13 @@ def load_model_mlflow(model_path: str, device: torch.device, embedding_dim: int 
                     elif 'model_version' in run_data.data.params:
                         model_version = run_data.data.params['model_version'].lower()
                         logger.info(f"Detected model version from MLflow params: {model_version}")
-                    # Check model_type tag (TinyAudioCNN_v2/v3 indicates version 2/3)
+                    # Check model_type tag (TinyAudioCNN_v2/v3/v4 indicates version 2/3/4)
                     elif 'model_type' in run_data.data.tags:
                         model_type = run_data.data.tags['model_type']
-                        if 'v3' in model_type.lower() or 'TinyAudioCNN_v3' in model_type or 'MobileNetV2' in model_type:
+                        if 'v4' in model_type.lower() or 'TinyAudioCNN_v4' in model_type or 'MBConv' in model_type or 'SE-Attention' in model_type:
+                            model_version = '4'
+                            logger.info(f"Detected model version from model_type tag: {model_version}")
+                        elif 'v3' in model_type.lower() or 'TinyAudioCNN_v3' in model_type or 'MobileNetV2' in model_type:
                             model_version = '3'
                             logger.info(f"Detected model version from model_type tag: {model_version}")
                         elif 'v2' in model_type.lower() or 'TinyAudioCNN_v2' in model_type or '2' in model_type:
@@ -537,10 +540,13 @@ def load_model_mlflow(model_path: str, device: torch.device, embedding_dim: int 
                         if model_version.startswith('v'):
                             model_version = model_version[1:]  # Remove 'v' prefix
                         logger.info(f"Detected model version from MLflow params: {model_version}")
-                    # Check model_type tag (TinyAudioCNN_v2/v3 indicates version 2/3)
+                    # Check model_type tag (TinyAudioCNN_v2/v3/v4 indicates version 2/3/4)
                     elif 'model_type' in run_data.data.tags:
                         model_type = run_data.data.tags['model_type']
-                        if 'v3' in model_type.lower() or 'TinyAudioCNN_v3' in model_type or 'MobileNetV2' in model_type:
+                        if 'v4' in model_type.lower() or 'TinyAudioCNN_v4' in model_type or 'MBConv' in model_type or 'SE-Attention' in model_type:
+                            model_version = '4'
+                            logger.info(f"Detected model version from model_type tag: {model_version}")
+                        elif 'v3' in model_type.lower() or 'TinyAudioCNN_v3' in model_type or 'MobileNetV2' in model_type:
                             model_version = '3'
                             logger.info(f"Detected model version from model_type tag: {model_version}")
                         elif 'v2' in model_type.lower() or 'TinyAudioCNN_v2' in model_type or '2' in model_type:
@@ -574,7 +580,10 @@ def load_model_mlflow(model_path: str, device: torch.device, embedding_dim: int 
     
     # Determine model class based on detected version
     # Default to version 1 if version cannot be determined
-    if model_version == '3':
+    if model_version == '4':
+        ModelClass = TinyAudioCNN_v4
+        model_name = 'TinyAudioCNN_v4'
+    elif model_version == '3':
         ModelClass = TinyAudioCNN_v3
         model_name = 'TinyAudioCNN_v3'
     elif model_version == '2':
@@ -1512,6 +1521,13 @@ def test_module_infrastructure():
             logger.info(f"   V3 model has {params_v3['total']:,} parameters")
             logger.info(f"   V3 vs V1: {params_v3['total'] / params_v1['total']:.2f}x")
             logger.info(f"   V3 vs V2: {params_v3['total'] / params_v2['total']:.2f}x")
+            
+            model_v4 = TinyAudioCNN_v4(embedding_dim=64)
+            logger.info("✅ TinyAudioCNN_v4 (v4) model can be instantiated")
+            params_v4 = model_v4.count_parameters()
+            logger.info(f"   V4 model has {params_v4['total']:,} parameters")
+            logger.info(f"   V4 vs V1: {params_v4['total'] / params_v1['total']:.2f}x")
+            logger.info(f"   V4 vs V3: {params_v4['total'] / params_v3['total']:.2f}x")
         except Exception as e:
             logger.error(f"❌ Failed to instantiate model: {e}")
             return False
